@@ -1350,18 +1350,13 @@ def print_ai_analysis_summary(root_cause_groups: Dict[str, List[RunAnalysis]], t
     print(f"{Color.GREEN}✓ Detailed report saved to: {Color.BOLD}{report_file}{Color.NC}")
 
 
-def analyze_directory(logs_dir: Path, ai_analyze: bool = False, output_file: Optional[str] = None, pr_limit: Optional[int] = None, exclude_infra_categories: Optional[List[str]] = None) -> Summary:
+def analyze_directory(logs_dir: Path, ai_analyze: bool = False, output_file: Optional[str] = None, pr_limit: Optional[int] = None) -> Summary:
     """Analyze all CI runs in a directory."""
     print_header()
     print(f"{Color.CYAN}Scanning directory: {logs_dir}{Color.NC}")
     if pr_limit:
         print(f"{Color.CYAN}Limiting to {pr_limit} most recent PRs{Color.NC}")
-    if exclude_infra_categories:
-        print(f"{Color.CYAN}Excluding infra categories: {', '.join(exclude_infra_categories)}{Color.NC}")
     print()
-
-    # Convert excluded category names to set for fast lookup
-    excluded_categories = set(exclude_infra_categories) if exclude_infra_categories else set()
 
     summary = Summary()
 
@@ -1393,16 +1388,6 @@ def analyze_directory(logs_dir: Path, ai_analyze: bool = False, output_file: Opt
                     continue
                 
                 analysis = analyze_run(run_dir, pr_number, run_id, job_name=job_dir.name)
-
-                # Check if this infra failure category should be excluded
-                if analysis.classification == Classification.INFRA_FAILURE and excluded_categories:
-                    category_name = ""
-                    if analysis.build_log_analysis and analysis.build_log_analysis.infra_failure_category:
-                        category_name = analysis.build_log_analysis.infra_failure_category.value
-                    if category_name in excluded_categories:
-                        # Skip this run entirely - don't count or display
-                        continue
-
                 print_run_result(analysis)
 
                 # Update summary
@@ -1450,7 +1435,7 @@ def analyze_directory(logs_dir: Path, ai_analyze: bool = False, output_file: Opt
         if output_file:
             report_file = Path(output_file)
         else:
-            report_file = Path("infra-failure-report.md")
+            report_file = Path("ci-failure-report.md")
         
         print_ai_analysis_summary(root_cause_groups, summary.infra_failures, report_file)
     
@@ -1469,19 +1454,6 @@ Examples:
   %(prog)s -s ./ci-logs/3843/pull-ci.../run-id/  # Single run analysis
   %(prog)s -o report.md                        # Generate report with custom filename
   %(prog)s --ai                                # Use AI to analyze infrastructure failures
-  %(prog)s --exclude-infra "Operator Install Timeout" "Script Error"  # Exclude categories
-
-Infrastructure Failure Categories (for --exclude-infra):
-  - "Repository Clone Failure"
-  - "Docker Image Timeout"
-  - "Operator Install Timeout"
-  - "Pod/Deployment Not Ready"
-  - "Missing CRD"
-  - "Helm Install Failed"
-  - "Cluster Connectivity"
-  - "Resource Quota Exceeded"
-  - "Script Error"
-  - "Unknown Infrastructure Error"
 
 Environment Variables:
   GEMINI_API_KEY or GOOGLE_API_KEY    Required for --ai mode
@@ -1515,13 +1487,6 @@ Environment Variables:
         default=None,
         help='Limit analysis to N most recent PRs (by PR number)'
     )
-    parser.add_argument(
-        '--exclude-infra',
-        nargs='+',
-        metavar='CATEGORY',
-        default=[],
-        help='Exclude specific infrastructure failure categories from analysis (can specify multiple)'
-    )
 
     args = parser.parse_args()
     path = Path(args.path)
@@ -1537,8 +1502,7 @@ Environment Variables:
             path,
             ai_analyze=args.ai,
             output_file=args.output,
-            pr_limit=args.limit,
-            exclude_infra_categories=args.exclude_infra
+            pr_limit=args.limit
         )
 
 

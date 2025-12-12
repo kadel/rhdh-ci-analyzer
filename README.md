@@ -52,9 +52,6 @@ uv run classify-failures.py -s ./ci-logs/3843/pull-ci-redhat-developer-rhdh-main
 # Use Gemini AI to analyze infrastructure failures (requires GEMINI_API_KEY)
 export GEMINI_API_KEY="your-key"
 uv run classify-failures.py --ai
-
-# Exclude specific infrastructure failure categories from analysis
-uv run classify-failures.py --exclude-infra "Operator Install Timeout" "Script Error"
 ```
 
 **Output:**
