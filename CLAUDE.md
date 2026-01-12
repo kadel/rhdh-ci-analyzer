@@ -30,6 +30,9 @@ uv run download-ci-logs.py ./ci-logs
 # Download with options
 uv run download-ci-logs.py ./ci-logs --max-prs 100 --max-workers 20
 
+# Download without large media files (saves ~90% storage)
+uv run download-ci-logs.py ./ci-logs --exclude-media
+
 # Download only junit reports (faster)
 uv run download-junit-reports.py ./ci-logs
 
@@ -167,6 +170,7 @@ Arguments:
   --max-prs N       Maximum PRs to process (default: 200)
   --max-workers N   Parallel download workers (default: 10)
   --job-names       Job names to download (default: main and release-1.8 e2e-ocp-helm)
+  --exclude-media   Exclude large media files (traces, videos, screenshots, tarballs) - saves ~90% storage
 ```
 
 ### download-junit-reports.py

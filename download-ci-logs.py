@@ -23,7 +23,14 @@ JOB_NAMES = [
     "pull-ci-redhat-developer-rhdh-main-e2e-ocp-helm",
     "pull-ci-redhat-developer-rhdh-release-1.8-e2e-ocp-helm",
 ]
-EXCLUDE_PATTERNS = ["*gather-extra*", "*gather-audit-logs*", "*.webm"]
+EXCLUDE_PATTERNS = ["*gather-extra*", "*gather-audit-logs*"]
+MEDIA_EXCLUDE_PATTERNS = [
+    "*trace.zip",    # Playwright traces (~102G)
+    "*.webm",        # Test videos (~77G)
+    "*.tar",         # must-gather tarballs (~32G)
+    "*.png",         # Screenshots (~2.5G)
+    "*.gstmp",       # Temp/staging files (~3G)
+]
 MAX_PRS = 200
 MAX_WORKERS = 10
 
@@ -183,8 +190,18 @@ def main():
         default=JOB_NAMES,
         help="Job names to download",
     )
-    
+    parser.add_argument(
+        "--exclude-media",
+        action="store_true",
+        help="Exclude large media files (traces, videos, screenshots, tarballs) to save ~90%% storage",
+    )
+
     args = parser.parse_args()
+
+    # Build exclude patterns
+    exclude_patterns = EXCLUDE_PATTERNS.copy()
+    if args.exclude_media:
+        exclude_patterns.extend(MEDIA_EXCLUDE_PATTERNS)
     
     output_dir = Path(args.output_dir)
     
@@ -225,7 +242,7 @@ def main():
                 pr,
                 args.job_names,
                 output_dir,
-                EXCLUDE_PATTERNS,
+                exclude_patterns,
             ): pr
             for pr in pr_list
         }
