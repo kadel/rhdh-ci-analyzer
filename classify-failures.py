@@ -119,6 +119,7 @@ class AIRootCauseAnalysis:
     root_cause_detail: str = ""    # Detailed explanation
     suggested_fix: str = ""        # Suggested fix or investigation steps
     confidence: str = ""           # high/medium/low
+    relevant_log_lines: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -187,6 +188,50 @@ class Summary:
     analyzed_prs: set = field(default_factory=set)  # Unique PR numbers analyzed
 
 
+# Gzip magic bytes
+GZIP_MAGIC = b"\x1f\x8b"
+
+
+def is_gzipped(filepath: Path) -> bool:
+    """Check if a file is gzip compressed by reading magic bytes."""
+    try:
+        with open(filepath, "rb") as f:
+            magic = f.read(2)
+            return magic == GZIP_MAGIC
+    except (IOError, OSError):
+        return False
+
+
+def read_file_text(filepath: Path) -> Optional[str]:
+    """Read a text file, automatically detecting and handling gzip compression."""
+    if not filepath.exists():
+        return None
+
+    try:
+        if is_gzipped(filepath):
+            with gzip.open(filepath, "rt", encoding="utf-8", errors="replace") as f:
+                return f.read()
+        else:
+            return filepath.read_text(encoding="utf-8", errors="replace")
+    except (IOError, OSError):
+        return None
+
+
+def read_file_bytes(filepath: Path) -> Optional[bytes]:
+    """Read a file as bytes, automatically detecting and handling gzip compression."""
+    if not filepath.exists():
+        return None
+
+    try:
+        if is_gzipped(filepath):
+            with gzip.open(filepath, "rb") as f:
+                return f.read()
+        else:
+            return filepath.read_bytes()
+    except (IOError, OSError):
+        return None
+
+
 def count_files(directory: Path, extension: str) -> int:
     """Count files with a specific extension in a directory tree."""
     if not directory.exists():
@@ -200,8 +245,11 @@ def parse_junit(junit_path: Path, pr_number: str = "", run_id: str = "", suite_t
         return None
 
     try:
-        tree = ET.parse(junit_path)
-        root = tree.getroot()
+        # Read file content (handles gzip automatically)
+        content = read_file_text(junit_path)
+        if not content:
+            return None
+        root = ET.fromstring(content)
 
         stats = JUnitStats(
             tests=int(root.get('tests', 0)),
@@ -250,52 +298,30 @@ def parse_junit(junit_path: Path, pr_number: str = "", run_id: str = "", suite_t
 
 def read_overall_result(result_path: Path) -> Optional[int]:
     """Read OVERALL_RESULT.txt and return the status code."""
-    if not result_path.exists():
+    content = read_file_text(result_path)
+    if not content:
         return None
-    
+
     try:
-        content = result_path.read_text().strip()
-        return int(content)
-    except (ValueError, IOError):
+        return int(content.strip())
+    except ValueError:
         return None
 
 
 def read_build_log(log_path: Path) -> Optional[str]:
     """Read build log content, handling gzip compression if needed."""
-    if not log_path.exists():
-        return None
-    
-    try:
-        # Try reading as gzip first
-        with gzip.open(log_path, 'rt', encoding='utf-8', errors='replace') as f:
-            return f.read()
-    except gzip.BadGzipFile:
-        # Not gzip, try plain text
-        try:
-            return log_path.read_text(encoding='utf-8', errors='replace')
-        except IOError:
-            return None
-    except IOError:
-        return None
+    return read_file_text(log_path)
 
 
 def read_json_file(json_path: Path) -> Optional[dict]:
     """Read a JSON file, handling gzip compression if needed."""
-    if not json_path.exists():
+    content = read_file_text(json_path)
+    if not content:
         return None
-    
+
     try:
-        # Try reading as gzip first
-        with gzip.open(json_path, 'rt', encoding='utf-8', errors='replace') as f:
-            return json.load(f)
-    except gzip.BadGzipFile:
-        # Not gzip, try plain text
-        try:
-            with open(json_path, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except (IOError, json.JSONDecodeError):
-            return None
-    except (IOError, json.JSONDecodeError):
+        return json.loads(content)
+    except json.JSONDecodeError:
         return None
 
 
@@ -351,32 +377,42 @@ def analyze_with_ai(client, build_log_content: str) -> AIRootCauseAnalysis:
     
     Uses the google-genai library: https://googleapis.github.io/python-genai/
     """
-    # Truncate log if too long (keep last part which usually has the error)
+    # Truncate log if too long (keep start and end)
     max_chars = 30000
     if len(build_log_content) > max_chars:
-        build_log_content = "... [truncated] ...\n" + build_log_content[-max_chars:]
+        # Keep first 5000 chars (setup/clone) and last 25000 chars (error/timeout)
+        head_chars = 5000
+        tail_chars = 25000
+        build_log_content = build_log_content[:head_chars] + "\n... [middle truncated] ...\n" + build_log_content[-tail_chars:]
     
-    prompt = f"""Analyze this CI build log from an OpenShift/Kubernetes test infrastructure failure.
-The Playwright E2E tests never started - this is an infrastructure/environment setup failure.
+    prompt = f"""You are an expert SRE analyzing CI build logs for Red Hat Developer Hub (RHDH) on OpenShift.
+The Playwright E2E tests never started, indicating an infrastructure or environment setup failure.
 
-Determine the ROOT CAUSE of the failure. Focus on:
-- Operator installation failures (timeouts, CRD issues)
-- RHDH Docker image availability issues
-- CLI Docker image availability issues
-- Cluster provisioning problems
-- Network/connectivity issues
-- Resource quota/limits
-- Configuration errors
+Your goal is to identify the precise ROOT CAUSE.
 
-Respond in this exact JSON format (no markdown, just JSON):
+Key Failure Categories to consider (but be specific):
+- ImagePullBackOff / Docker Image Timeout (RHDH or CLI images)
+- Operator Installation Timeout (e.g. CrunchyDB, Prometheus)
+- PVC/Storage Provisioning Failed
+- Cluster Connectivity / Network Issues
+- Resource Quota Exceeded (CPU/Memory)
+- Helm Chart Installation Failed
+- Missing CRDs (Custom Resource Definitions)
+- Script/Setup Logic Errors
+- Git Clone/Fetch Failures
+
+Analyze the log, find the specific error lines, and determine the root cause.
+
+Respond in this exact JSON format (no markdown):
 {{
-  "root_cause_category": "<short category, max 50 chars, e.g., 'Postgres Operator Installation Timeout'>",
-  "root_cause_detail": "<1-2 sentence explanation of what failed>",
-  "suggested_fix": "<brief suggestion for fix or investigation>",
+  "root_cause_category": "<short, specific category, e.g., 'CrunchyDB Operator Timeout'>",
+  "root_cause_detail": "<concise explanation of the failure context>",
+  "relevant_log_lines": ["<exact log line 1>", "<exact log line 2>"],
+  "suggested_fix": "<actionable remediation step>",
   "confidence": "<high|medium|low>"
 }}
 
-BUILD LOG:
+BUILD LOG (truncated):
 {build_log_content}
 """
     
@@ -398,7 +434,8 @@ BUILD LOG:
             root_cause_category=data.get("root_cause_category", "Unknown"),
             root_cause_detail=data.get("root_cause_detail", ""),
             suggested_fix=data.get("suggested_fix", ""),
-            confidence=data.get("confidence", "low")
+            confidence=data.get("confidence", "low"),
+            relevant_log_lines=data.get("relevant_log_lines", [])
         )
     except Exception as e:
         return AIRootCauseAnalysis(
@@ -575,7 +612,7 @@ def _detect_infra_failure_category(analysis: BuildLogAnalysis, log_content: str)
         analysis.infra_failure_detail = analysis.timeout_message or analysis.error_message
 
 
-def analyze_run(run_path: Path, pr_number: str, run_id: str, job_name: str = "") -> RunAnalysis:
+def analyze_run(run_path: Path, pr_number: str, run_id: str, job_name: str = "", ai_client=None) -> RunAnalysis:
     """Analyze a single CI run and classify it."""
     analysis = RunAnalysis(
         pr_number=pr_number,
@@ -667,7 +704,12 @@ def analyze_run(run_path: Path, pr_number: str, run_id: str, job_name: str = "")
     elif log_analysis and (log_analysis.has_timeout or log_analysis.has_error or log_analysis.infra_failure_category):
         # Error or timeout before tests started
         analysis.classification = Classification.INFRA_FAILURE
-        if log_analysis.infra_failure_category:
+        if ai_client and analysis.build_log_content:
+            # Use AI to analyze the infrastructure failure
+            ai_result = analyze_with_ai(ai_client, analysis.build_log_content)
+            analysis.ai_analysis = ai_result
+            analysis.reason = f"{ai_result.root_cause_category}: {ai_result.root_cause_detail}" if ai_result.root_cause_detail else ai_result.root_cause_category
+        elif log_analysis.infra_failure_category:
             cat = log_analysis.infra_failure_category.value
             detail = log_analysis.infra_failure_detail
             analysis.reason = f"{cat}: {detail}" if detail else cat
@@ -678,7 +720,13 @@ def analyze_run(run_path: Path, pr_number: str, run_id: str, job_name: str = "")
     elif log_analysis:
         # Build log exists but no clear indicators - likely infra failure
         analysis.classification = Classification.INFRA_FAILURE
-        analysis.reason = "Tests never started - check build log for details"
+        if ai_client and analysis.build_log_content:
+            # Use AI to analyze the infrastructure failure
+            ai_result = analyze_with_ai(ai_client, analysis.build_log_content)
+            analysis.ai_analysis = ai_result
+            analysis.reason = f"{ai_result.root_cause_category}: {ai_result.root_cause_detail}" if ai_result.root_cause_detail else ai_result.root_cause_category
+        else:
+            analysis.reason = "Tests never started - check build log for details"
     else:
         # No build log - use artifact-based classification as fallback
         total_webm = analysis.webm_count_showcase + analysis.webm_count_rbac
@@ -738,7 +786,7 @@ def print_run_result(analysis: RunAnalysis):
         print(f"      {Color.CYAN}→ Build log: {analysis.build_log_path}{Color.NC}")
 
 
-def print_summary(summary: Summary):
+def print_summary(summary: Summary, ai_analyze: bool = False):
     """Print the summary statistics."""
     print()
     print(f"{Color.BOLD}════════════════════════════════════════════════════════════════════{Color.NC}")
@@ -747,48 +795,59 @@ def print_summary(summary: Summary):
     print()
     print(f"PRs analyzed: {Color.BOLD}{len(summary.analyzed_prs)}{Color.NC} | Total CI runs: {Color.BOLD}{summary.total}{Color.NC}")
     print()
-    
+
     infra_pct = (summary.infra_failures * 100 // summary.total) if summary.total > 0 else 0
     test_fail_pct = (summary.test_failures * 100 // summary.total) if summary.total > 0 else 0
     test_succ_pct = (summary.test_successes * 100 // summary.total) if summary.total > 0 else 0
     aborted_pct = (summary.job_aborted * 100 // summary.total) if summary.total > 0 else 0
-    
+
     print(f"  {Color.RED}■{Color.NC} Infrastructure failures: {Color.BOLD}{summary.infra_failures}{Color.NC} ({infra_pct}%)")
     print(f"  {Color.YELLOW}■{Color.NC} Test failures:          {Color.BOLD}{summary.test_failures}{Color.NC} ({test_fail_pct}%)")
     print(f"  {Color.GREEN}■{Color.NC} Test successes:         {Color.BOLD}{summary.test_successes}{Color.NC} ({test_succ_pct}%)")
     print(f"  {Color.CYAN}■{Color.NC} Jobs aborted:           {Color.BOLD}{summary.job_aborted}{Color.NC} ({aborted_pct}%)")
-    
+
     if summary.unknown > 0:
         print(f"  {Color.BLUE}■{Color.NC} Unknown:                {Color.BOLD}{summary.unknown}{Color.NC}")
-    
+
     print()
-    
+
     # Show aborted jobs detail
     if summary.aborted_runs:
         print(f"{Color.BOLD}Aborted Jobs:{Color.NC}")
         for analysis in summary.aborted_runs:
             print(f"  PR #{analysis.pr_number} [{analysis.run_id}]: {analysis.reason}")
         print()
-    
+
     # Show infrastructure failures grouped by category
     if summary.infra_failure_runs:
-        print(f"{Color.BOLD}Infrastructure Failures by Category:{Color.NC}")
-        
-        # Group by category
+        if ai_analyze:
+            print(f"{Color.BOLD}Infrastructure Failures by Root Cause (AI Analysis):{Color.NC}")
+        else:
+            print(f"{Color.BOLD}Infrastructure Failures by Category:{Color.NC}")
+
+        # Group by category (use AI category if available, otherwise regex category)
         by_category: Dict[str, list] = defaultdict(list)
         for analysis in summary.infra_failure_runs:
-            if analysis.build_log_analysis and analysis.build_log_analysis.infra_failure_category:
+            if ai_analyze and analysis.ai_analysis:
+                cat = analysis.ai_analysis.root_cause_category
+            elif analysis.build_log_analysis and analysis.build_log_analysis.infra_failure_category:
                 cat = analysis.build_log_analysis.infra_failure_category.value
             else:
                 cat = "Unknown"
             by_category[cat].append(analysis)
-        
+
         # Print by category (sorted by count)
         for cat, runs in sorted(by_category.items(), key=lambda x: -len(x[1])):
-            print(f"\n  {Color.YELLOW}{cat}{Color.NC} ({len(runs)} failures):")
+            # Show confidence for AI analysis
+            confidence_str = ""
+            if ai_analyze and runs and runs[0].ai_analysis and runs[0].ai_analysis.confidence:
+                confidence_str = f" [{runs[0].ai_analysis.confidence}]"
+            print(f"\n  {Color.YELLOW}{cat}{Color.NC}{confidence_str} ({len(runs)} failures):")
             for analysis in runs[:5]:  # Show max 5 per category
                 detail = ""
-                if analysis.build_log_analysis and analysis.build_log_analysis.infra_failure_detail:
+                if ai_analyze and analysis.ai_analysis and analysis.ai_analysis.root_cause_detail:
+                    detail = f" - {analysis.ai_analysis.root_cause_detail[:60]}"
+                elif analysis.build_log_analysis and analysis.build_log_analysis.infra_failure_detail:
                     detail = f" - {analysis.build_log_analysis.infra_failure_detail[:60]}"
                 print(f"    PR #{analysis.pr_number}{detail}")
             if len(runs) > 5:
@@ -996,85 +1055,6 @@ def analyze_single_run_detailed(run_path: Path):
             print(f"  {Color.CYAN}{analysis.build_log_path}{Color.NC}")
 
 
-def analyze_infra_failures_with_ai(summary: Summary, client) -> Dict[str, List[RunAnalysis]]:
-    """Use AI to analyze all infrastructure failures and group by root cause."""
-    print()
-    print(f"{Color.BOLD}════════════════════════════════════════════════════════════════════{Color.NC}")
-    print(f"{Color.BOLD}AI Root Cause Analysis (using Gemini){Color.NC}")
-    print(f"{Color.BOLD}════════════════════════════════════════════════════════════════════{Color.NC}")
-    print()
-    
-    total = len(summary.infra_failure_runs)
-    root_cause_groups: Dict[str, List[RunAnalysis]] = defaultdict(list)
-    
-    for i, analysis in enumerate(summary.infra_failure_runs, 1):
-        print(f"  Analyzing {i}/{total}: PR #{analysis.pr_number} [{analysis.run_id}]", end="", flush=True)
-        
-        if analysis.build_log_content:
-            ai_result = analyze_with_ai(client, analysis.build_log_content)
-            analysis.ai_analysis = ai_result
-            root_cause_groups[ai_result.root_cause_category].append(analysis)
-            print(f" → {Color.CYAN}{ai_result.root_cause_category}{Color.NC}")
-        else:
-            analysis.ai_analysis = AIRootCauseAnalysis(
-                root_cause_category="No Build Log",
-                root_cause_detail="Build log not available for analysis",
-                confidence="low"
-            )
-            root_cause_groups["No Build Log"].append(analysis)
-            print(f" → {Color.YELLOW}No build log{Color.NC}")
-        
-        # Rate limiting - small delay between API calls
-        time.sleep(0.5)
-    
-    return root_cause_groups
-
-
-def generate_markdown_report(root_cause_groups: Dict[str, List[RunAnalysis]], total_infra_failures: int) -> str:
-    """Generate the markdown report content for AI analysis."""
-    lines = []
-    sorted_causes = sorted(root_cause_groups.items(), key=lambda x: len(x[1]), reverse=True)
-    
-    lines.append("# Infrastructure Failure Root Cause Analysis")
-    lines.append("")
-    lines.append(f"**Total Infrastructure Failures:** {total_infra_failures}")
-    lines.append("")
-    lines.append("## Root Causes by Frequency")
-    lines.append("")
-    lines.append("| Rank | Root Cause | Count | % | Confidence |")
-    lines.append("|------|------------|-------|---|------------|")
-    for rank, (cause, runs) in enumerate(sorted_causes, 1):
-        count = len(runs)
-        percentage = (count * 100) // total_infra_failures if total_infra_failures > 0 else 0
-        confidence = runs[0].ai_analysis.confidence if runs and runs[0].ai_analysis else "N/A"
-        lines.append(f"| {rank} | {cause} | {count} | {percentage}% | {confidence} |")
-    lines.append("")
-    
-    for rank, (cause, runs) in enumerate(sorted_causes, 1):
-        lines.append(f"### {rank}. {cause}")
-        lines.append("")
-        if runs and runs[0].ai_analysis:
-            ai = runs[0].ai_analysis
-            if ai.confidence:
-                lines.append(f"**Confidence:** {ai.confidence}")
-                lines.append("")
-            if ai.root_cause_detail:
-                lines.append(f"**Detail:** {ai.root_cause_detail}")
-                lines.append("")
-            if ai.suggested_fix:
-                lines.append(f"**Suggested Fix:** {ai.suggested_fix}")
-                lines.append("")
-        lines.append("**Affected Jobs:**")
-        lines.append("")
-        for run in runs:
-            prow_url = run.get_prow_url()
-            github_url = run.get_github_pr_url()
-            lines.append(f"- [PR #{run.pr_number}]({github_url}) ([job logs]({prow_url}))")
-        lines.append("")
-    
-    return "\n".join(lines)
-
-
 def _slugify(text: str) -> str:
     """Convert text to a markdown anchor slug."""
     # Lowercase, replace spaces with hyphens, remove special characters
@@ -1083,14 +1063,17 @@ def _slugify(text: str) -> str:
     return slug
 
 
-def generate_summary_markdown_report(summary: Summary) -> str:
-    """Generate a markdown report from the summary (no AI analysis)."""
+def generate_summary_markdown_report(summary: Summary, ai_analyze: bool = False) -> str:
+    """Generate a markdown report from the summary."""
     lines = []
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     lines.append("# CI Failure Classification Report")
     lines.append("")
     lines.append(f"**Generated:** {timestamp}")
+    if ai_analyze:
+        lines.append("")
+        lines.append("*Infrastructure failures analyzed using AI*")
     lines.append("")
 
     # Summary statistics
@@ -1114,7 +1097,9 @@ def generate_summary_markdown_report(summary: Summary) -> str:
     by_category: Dict[str, List[RunAnalysis]] = defaultdict(list)
     if summary.infra_failure_runs:
         for analysis in summary.infra_failure_runs:
-            if analysis.build_log_analysis and analysis.build_log_analysis.infra_failure_category:
+            if ai_analyze and analysis.ai_analysis:
+                cat = analysis.ai_analysis.root_cause_category
+            elif analysis.build_log_analysis and analysis.build_log_analysis.infra_failure_category:
                 cat = analysis.build_log_analysis.infra_failure_category.value
             else:
                 cat = "Unknown"
@@ -1128,15 +1113,25 @@ def generate_summary_markdown_report(summary: Summary) -> str:
 
     # Summary: Top 10 Infrastructure Failure Categories
     if by_category:
-        lines.append("### Top Infrastructure Failure Categories")
-        lines.append("")
-        lines.append("| Rank | Category | Count | Details |")
-        lines.append("|------|----------|-------|---------|")
+        if ai_analyze:
+            lines.append("### Top Infrastructure Failure Root Causes (AI Analysis)")
+            lines.append("")
+            lines.append("| Rank | Root Cause | Count | Confidence | Details |")
+            lines.append("|------|------------|-------|------------|---------|")
+        else:
+            lines.append("### Top Infrastructure Failure Categories")
+            lines.append("")
+            lines.append("| Rank | Category | Count | Details |")
+            lines.append("|------|----------|-------|---------|")
         total_infra = len(summary.infra_failure_runs)
         for rank, (cat, runs) in enumerate(sorted(by_category.items(), key=lambda x: -len(x[1]))[:10], 1):
             pct = len(runs) * 100 // total_infra if total_infra > 0 else 0
             anchor = _slugify(cat)
-            lines.append(f"| {rank} | [{cat}](#{anchor}) | {len(runs)} ({pct}%) | [Details](#{anchor}) |")
+            if ai_analyze:
+                confidence = runs[0].ai_analysis.confidence if runs and runs[0].ai_analysis else "N/A"
+                lines.append(f"| {rank} | [{cat}](#{anchor}) | {len(runs)} ({pct}%) | {confidence} | [Details](#{anchor}) |")
+            else:
+                lines.append(f"| {rank} | [{cat}](#{anchor}) | {len(runs)} ({pct}%) | [Details](#{anchor}) |")
         lines.append("")
 
     # Summary: Top 10 Failing Test Cases
@@ -1155,30 +1150,55 @@ def generate_summary_markdown_report(summary: Summary) -> str:
 
     # Infrastructure failures by category (detailed)
     if summary.infra_failure_runs:
-        lines.append("## Infrastructure Failures by Category")
+        if ai_analyze:
+            lines.append("## Infrastructure Failures by Root Cause")
+        else:
+            lines.append("## Infrastructure Failures by Category")
         lines.append("")
 
         # Summary table with anchors
-        lines.append("| Category | Count | Percentage |")
-        lines.append("|----------|-------|------------|")
+        if ai_analyze:
+            lines.append("| Root Cause | Count | Percentage | Confidence |")
+            lines.append("|------------|-------|------------|------------|")
+        else:
+            lines.append("| Category | Count | Percentage |")
+            lines.append("|----------|-------|------------|")
         total_infra = len(summary.infra_failure_runs)
         for cat, runs in sorted(by_category.items(), key=lambda x: -len(x[1])):
             pct = len(runs) * 100 // total_infra if total_infra > 0 else 0
             anchor = _slugify(cat)
-            lines.append(f"| [{cat}](#{anchor}) | {len(runs)} | {pct}% |")
+            if ai_analyze:
+                confidence = runs[0].ai_analysis.confidence if runs and runs[0].ai_analysis else "N/A"
+                lines.append(f"| [{cat}](#{anchor}) | {len(runs)} | {pct}% | {confidence} |")
+            else:
+                lines.append(f"| [{cat}](#{anchor}) | {len(runs)} | {pct}% |")
         lines.append("")
 
         # Details per category
         for cat, runs in sorted(by_category.items(), key=lambda x: -len(x[1])):
             lines.append(f"### {cat}")
             lines.append("")
+            # Show AI analysis details if available
+            if ai_analyze and runs and runs[0].ai_analysis:
+                ai = runs[0].ai_analysis
+                if ai.confidence:
+                    lines.append(f"**Confidence:** {ai.confidence}")
+                    lines.append("")
+                if ai.root_cause_detail:
+                    lines.append(f"**Detail:** {ai.root_cause_detail}")
+                    lines.append("")
+                if ai.suggested_fix:
+                    lines.append(f"**Suggested Fix:** {ai.suggested_fix}")
+                    lines.append("")
             lines.append(f"**{len(runs)} failures**")
             lines.append("")
             for run in runs:
                 prow_url = run.get_prow_url()
                 github_url = run.get_github_pr_url()
                 detail = ""
-                if run.build_log_analysis and run.build_log_analysis.infra_failure_detail:
+                if ai_analyze and run.ai_analysis and run.ai_analysis.root_cause_detail:
+                    detail = f" - {run.ai_analysis.root_cause_detail[:60]}"
+                elif run.build_log_analysis and run.build_log_analysis.infra_failure_detail:
                     detail = f" - {run.build_log_analysis.infra_failure_detail[:60]}"
                 lines.append(f"- [PR #{run.pr_number}]({github_url}) ([job logs]({prow_url})){detail}")
             lines.append("")
@@ -1316,47 +1336,20 @@ def generate_test_failure_markdown(failures: List[TestCaseFailure]) -> List[str]
     return lines
 
 
-def print_ai_analysis_summary(root_cause_groups: Dict[str, List[RunAnalysis]], total_infra_failures: int, report_file: Path):
-    """Print a quick summary to stdout and save detailed report to file."""
-    print()
-    print(f"{Color.BOLD}════════════════════════════════════════════════════════════════════{Color.NC}")
-    print(f"{Color.BOLD}Root Cause Summary{Color.NC}")
-    print(f"{Color.BOLD}════════════════════════════════════════════════════════════════════{Color.NC}")
-    print()
-    
-    # Sort by count (most common first)
-    sorted_causes = sorted(root_cause_groups.items(), key=lambda x: len(x[1]), reverse=True)
-    
-    # Quick summary table
-    print(f"{'Rank':<5} {'Root Cause':<45} {'Count':<7} {'%':<6} {'Confidence':<10}")
-    print("-" * 80)
-    for rank, (cause, runs) in enumerate(sorted_causes, 1):
-        count = len(runs)
-        percentage = (count * 100) // total_infra_failures if total_infra_failures > 0 else 0
-        confidence = runs[0].ai_analysis.confidence if runs and runs[0].ai_analysis else "N/A"
-        # Truncate long cause names for display
-        display_cause = cause[:42] + "..." if len(cause) > 45 else cause
-        print(f"{rank:<5} {display_cause:<45} {count:<7} {percentage}%{'':<4} {confidence}")
-    
-    print()
-    print(f"Total infrastructure failures: {Color.BOLD}{total_infra_failures}{Color.NC}")
-    print(f"Unique root causes identified: {Color.BOLD}{len(sorted_causes)}{Color.NC}")
-    
-    # Generate and save detailed markdown report
-    markdown_content = generate_markdown_report(root_cause_groups, total_infra_failures)
-    report_file.write_text(markdown_content)
-    
-    print()
-    print(f"{Color.GREEN}✓ Detailed report saved to: {Color.BOLD}{report_file}{Color.NC}")
-
-
 def analyze_directory(logs_dir: Path, ai_analyze: bool = False, output_file: Optional[str] = None, pr_limit: Optional[int] = None) -> Summary:
     """Analyze all CI runs in a directory."""
     print_header()
     print(f"{Color.CYAN}Scanning directory: {logs_dir}{Color.NC}")
     if pr_limit:
         print(f"{Color.CYAN}Limiting to {pr_limit} most recent PRs{Color.NC}")
+    if ai_analyze:
+        print(f"{Color.CYAN}Using AI for infrastructure failure analysis{Color.NC}")
     print()
+
+    # Initialize AI client early if needed
+    ai_client = None
+    if ai_analyze:
+        ai_client = init_gemini_client()
 
     summary = Summary()
 
@@ -1387,7 +1380,7 @@ def analyze_directory(logs_dir: Path, ai_analyze: bool = False, output_file: Opt
                 if not run_id.isdigit():
                     continue
                 
-                analysis = analyze_run(run_dir, pr_number, run_id, job_name=job_dir.name)
+                analysis = analyze_run(run_dir, pr_number, run_id, job_name=job_dir.name, ai_client=ai_client)
                 print_run_result(analysis)
 
                 # Update summary
@@ -1412,33 +1405,26 @@ def analyze_directory(logs_dir: Path, ai_analyze: bool = False, output_file: Opt
                 if analysis.junit_rbac and analysis.junit_rbac.failed_tests:
                     summary.all_test_failures.extend(analysis.junit_rbac.failed_tests)
     
-    print_summary(summary)
-    
-    # Always generate markdown report (unless AI analysis will generate its own)
-    if not ai_analyze:
-        if output_file:
-            report_file = Path(output_file)
-        else:
-            report_file = Path("ci-failure-report.md")
-        
-        markdown_content = generate_summary_markdown_report(summary)
-        report_file.write_text(markdown_content)
-        print()
-        print(f"{Color.GREEN}✓ Report saved to: {Color.BOLD}{report_file}{Color.NC}")
-    
-    # Run AI analysis if requested
-    if ai_analyze and summary.infra_failure_runs:
-        client = init_gemini_client()
-        root_cause_groups = analyze_infra_failures_with_ai(summary, client)
-        
-        # Determine report filename
-        if output_file:
-            report_file = Path(output_file)
-        else:
-            report_file = Path("ci-failure-report.md")
-        
-        print_ai_analysis_summary(root_cause_groups, summary.infra_failures, report_file)
-    
+    print_summary(summary, ai_analyze=ai_analyze)
+
+    # Generate markdown report
+    reports_dir = Path("reports")
+    reports_dir.mkdir(exist_ok=True)
+
+    timestamp_suffix = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+
+    if output_file:
+        # Use provided filename but add to reports dir with timestamp
+        base_name = Path(output_file).stem
+        report_file = reports_dir / f"{base_name}_{timestamp_suffix}.md"
+    else:
+        report_file = reports_dir / f"ci-failure-report_{timestamp_suffix}.md"
+
+    markdown_content = generate_summary_markdown_report(summary, ai_analyze=ai_analyze)
+    report_file.write_text(markdown_content)
+    print()
+    print(f"{Color.GREEN}✓ Report saved to: {Color.BOLD}{report_file}{Color.NC}")
+
     return summary
 
 
@@ -1448,11 +1434,11 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  %(prog)s                                    # Analyze ./ci-logs (generates report)
+  %(prog)s                                    # Analyze ./ci-logs (report saved to reports/)
   %(prog)s ./my-logs                          # Analyze custom directory
   %(prog)s -n 10                              # Analyze only 10 most recent PRs
   %(prog)s -s ./ci-logs/3843/pull-ci.../run-id/  # Single run analysis
-  %(prog)s -o report.md                        # Generate report with custom filename
+  %(prog)s -o my-report                        # Custom base name (reports/my-report_YYYY-MM-DD_HH-MM-SS.md)
   %(prog)s --ai                                # Use AI to analyze infrastructure failures
 
 Environment Variables:
@@ -1479,7 +1465,7 @@ Environment Variables:
         '-o', '--output',
         type=str,
         default=None,
-        help='Output file for report (default: ci-failure-report.md)'
+        help='Base name for report file (saved to reports/ with timestamp suffix)'
     )
     parser.add_argument(
         '-n', '--limit',

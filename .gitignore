@@ -44,5 +44,3 @@ Thumbs.db
 ci-logs/
 *.log
 
-# Generated reports
-ci-failure-report.md

@@ -16,15 +16,14 @@ This toolkit downloads CI logs, classifies failures, identifies the most common 
 # Install dependencies
 uv sync
 
-# Download recent CI logs (requires gcloud auth)
-gcloud auth application-default login
+# Download recent CI logs (GCS bucket is public, no auth required)
 uv run download-ci-logs.py ./ci-logs
 
-# Decompress build logs
-uv run extract_gzipped_logs.py
-
-# Analyze and generate report
+# Analyze and generate report (automatically handles gzipped files)
 uv run classify-failures.py ./ci-logs
+
+# Optional: Archive logs to save disk space
+uv run archive-logs.py ./ci-logs
 ```
 
 This generates `ci-failure-report.md` with:
@@ -37,7 +36,7 @@ This generates `ci-failure-report.md` with:
 
 ### classify-failures.py
 
-The main analysis tool. Classifies CI runs and generates reports.
+The main analysis tool. Classifies CI runs and generates reports. **Automatically detects and reads gzipped files** (checks magic bytes, not file extension).
 
 ```bash
 # Analyze all PRs in ci-logs directory
@@ -64,7 +63,13 @@ Downloads CI logs from the GCS bucket used by Prow.
 
 ```bash
 uv run download-ci-logs.py ./ci-logs
+uv run download-ci-logs.py ./ci-logs --max-prs 100 --max-workers 20
 ```
+
+Options:
+- `--max-prs N` - Maximum PRs to process (default: 200)
+- `--max-workers N` - Parallel download workers (default: 10)
+- `--job-names` - Job names to download
 
 Downloads logs for recent PRs from:
 - `pull-ci-redhat-developer-rhdh-main-e2e-ocp-helm`
@@ -72,18 +77,34 @@ Downloads logs for recent PRs from:
 
 ### download-junit-reports.py
 
-Downloads only the junit-results.xml files (faster than full logs).
+Downloads only the junit-results.xml files (faster than full logs). Only downloads from the main branch job.
 
 ```bash
 uv run download-junit-reports.py ./ci-logs
+uv run download-junit-reports.py ./ci-logs 20  # with 20 parallel workers
 ```
 
 ### extract_gzipped_logs.py
 
-Decompresses gzipped build-log.txt files in place.
+Decompresses gzipped build-log.txt files in place. **Optional** - `classify-failures.py` can read gzipped files directly.
 
 ```bash
 uv run extract_gzipped_logs.py
+```
+
+### archive-logs.py
+
+Compresses all uncompressed log files to save disk space. Detects already-compressed files by checking magic bytes (not file extension). Skips binary formats (.webm, .png, .jpg, etc.) by default.
+
+```bash
+# Compress all text/log files
+uv run archive-logs.py ./ci-logs
+
+# Preview what would be compressed
+uv run archive-logs.py ./ci-logs --dry-run
+
+# Include binary files (not recommended - they don't compress well)
+uv run archive-logs.py ./ci-logs --include-binary
 ```
 
 ## Classification Categories
@@ -93,12 +114,14 @@ Tests never started due to environment issues:
 
 | Category | Description |
 |----------|-------------|
+| Repository Clone Failure | Git clone failed |
 | Docker Image Timeout | PR image not available in registry |
 | Operator Install Timeout | Operator (e.g., Crunchy Postgres) failed to install |
 | Pod/Deployment Not Ready | Pods didn't reach ready state |
 | Missing CRD | Required CRD not installed |
 | Helm Install Failed | Helm chart installation failed |
 | Cluster Connectivity | Network/connection issues |
+| Resource Quota Exceeded | CPU/memory/quota limits exceeded |
 | Script Error | Setup script failed |
 
 ### Test Failures
@@ -125,8 +148,7 @@ The generated `ci-failure-report.md` includes:
 
 - Python 3.10+
 - [uv](https://github.com/astral-sh/uv) for dependency management
-- `gcloud` CLI for downloading logs
-- `GEMINI_API_KEY` for AI analysis (optional)
+- `GEMINI_API_KEY` or `GOOGLE_API_KEY` for AI analysis (optional)
 
 ## CI Log Structure (Prow Artifacts)
 
